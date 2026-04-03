@@ -13,13 +13,13 @@ The new workflow is:
 If layer messages are not available yet, `run` can also fall back to timed captures.
 
 
-- `SERIAL_PORT` to your printer port, for example `COM5`
-- `PAUSE_COMMANDS` to the pause/stop G-code that matches your printer workflow
+- `SERIAL_PORT` to the printer port, for example `COM5`
+- `PAUSE_COMMANDS` to the pause/stop G-code that matches the printer workflow
 - `CAMERAS` so both camera sources, crop areas, rotation, and mirroring are correct
 - `TRIGGER_MODE` to `layer`, `timer`, or `hybrid`
 
 ## Recommended Marlin trigger setup
-For best results, make your slicer emit a serial message at every layer change. A simple pattern is:
+For best results, make your slicer emit a serial message at every layer change (didn't work well without this). A simple pattern is:
 
 ```gcode
 M118 LAYER:[layer_num]
@@ -34,10 +34,10 @@ Create a Python environment and install the runtime dependencies:
 pip install numpy scipy scikit-image opencv-python pyserial matplotlib
 ```
 
-If you want spaghetti detection, also download the Darknet weights file into `ml_api/model/model.weights` using the URL in `ml_api/model/model.weights.url`.
+For spaghetti detection, also download the Darknet weights file into `ml_api/model/model.weights` using the URL in `ml_api/model/model.weights.url`.
 
 ## Running the monitor
-Start the monitor before you begin the print so capture index `000000.jpg` becomes the empty-bed background reference:
+The monitor needs to be started before beginning the print so capture index `000000.jpg` becomes the empty-bed background reference:
 
 ```bash
 python run --job-name test_part
@@ -71,7 +71,7 @@ captures/
 ```
 
 ## Detection logic
-The original score rules are still used and now run per camera:
+The score rules run per camera:
 
 - Detachment: `score > 1.0` and `deviance > 1.0`
 - Breakage: `score_diff > 0.2` and `deviance_diff > 0.2`
@@ -93,5 +93,4 @@ The confirmation mode is controlled by `FAILURE_CONFIRMATION_MODE` in [`api_keys
 - `M25` is mainly for SD-card prints. If your printer is driven differently, adjust `PAUSE_COMMANDS` to match your Marlin setup.
 - For the most reliable image comparison, park the toolhead out of frame at each trigger point or choose camera angles where the nozzle does not hide the part.
 
-## Legacy docs
-The original OctoPrint/Octolapse notes are still preserved in [`old_README.md`](/C:/Users/sagar/OneDrive/Desktop/Applications/Criss/3DPrintSaviour-marlin/old_README.md).
+
