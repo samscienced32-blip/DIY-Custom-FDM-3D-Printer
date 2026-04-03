@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+
+"""Dual-camera Marlin monitor entry point."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+
+from api_keys import (
+    CAMERAS,
+    CAPTURE_FRAME_DELAY_SECONDS,
+    CAPTURE_INTERVAL_SECONDS,
+    CAPTURE_ROOT,
+    CAPTURE_WARMUP_FRAMES,
+    JPEG_QUALITY,
+    SAVE_COMPOSITE_FRAMES,
+    SERIAL_LAYER_PATTERNS,
+    SERIAL_PORT,
+    TRIGGER_MODE,
+)
+from get_score import calculate_metrics, format_metrics
+from printcontrol import MarlinPrinterController, analyse_camera_frame, decide_failure
+
+IMAGE_OPTIONS = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+LAYER_REGEX = re.compile(r"(?:LAYER:|layer:)\s*(-?\d+)")
+
+
+def timestamp_job_name():
+    return datetime.now().strftime("job_%Y%m%d_%H%M%S")
+
+
+def safe_job_name(value: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return clean or timestamp_job_name()
+
+
+def parse_source(value):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return value
+
+
+class CameraDevice:
+    def __init__(self, config):
+        self.name = config["name"]
+        self.source = parse_source(config["source"])
+        self.rotate = int(config.get("rotate", 0))
+        self.mirror = bool(config.get("mirror", False))
+        self.capture = None
+
+    def open(self):
+        backend = cv2.CAP_DSHOW if os.name == "nt" and isinstance(self.source, int) else cv2.CAP_ANY
+        self.capture = cv2.VideoCapture(self.source, backend)
+        if not self.capture.isOpened():
+            raise RuntimeError(f"Unable to open camera {self.name} ({self.source})")
+        return self
+
+    def grab(self):
+        if self.capture is None:
+            self.open()
+
+        for _ in range(CAPTURE_WARMUP_FRAMES):
+            self.capture.read()
+            time.sleep(CAPTURE_FRAME_DELAY_SECONDS)
+
+        ok, frame = self.capture.read()
+        if not ok or frame is None:
+            raise RuntimeError(f"Unable to capture a frame from {self.name}")
+
+        if self.rotate == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif self.rotate == 180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif self.rotate == 270:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        if self.mirror:
+            frame = cv2.flip(frame, 1)
+
+        return frame
+
+    def close(self):
+        if self.capture is not None:
+            self.capture.release()
+
+
+def ensure_directory(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_text_line(path: Path, text: str):
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(text.rstrip() + "\n")
+
+
+def save_frame(path: Path, frame):
+    cv2.imwrite(str(path), frame, IMAGE_OPTIONS)
+
+
+def save_composite_frame(path: Path, frames):
+    if not frames:
+        return
+
+    target_height = min(frame.shape[0] for frame in frames)
+    resized = []
+    for frame in frames:
+        width = int(frame.shape[1] * (target_height / frame.shape[0]))
+        resized.append(cv2.resize(frame, (width, target_height)))
+    composite = cv2.hconcat(resized)
+    save_frame(path, composite)
+
+
+def parse_layer_message(line: str):
+    if not line:
+        return None
+
+    if not any(pattern in line for pattern in SERIAL_LAYER_PATTERNS):
+        return None
+
+    match = LAYER_REGEX.search(line)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def capture_event(session_root: Path, cameras, capture_index: int, reported_layer=None):
+    reports = []
+    captured_frames = []
+
+    for camera in cameras:
+        frame = camera.grab()
+        captured_frames.append(frame)
+
+        camera_dir = ensure_directory(session_root / camera.name)
+        image_path = camera_dir / f"{capture_index:06d}.jpg"
+        save_frame(image_path, frame)
+
+        metrics = calculate_metrics(image_path, camera_name=camera.name)
+        write_text_line(camera_dir / "output.log", format_metrics(metrics))
+
+        report = analyse_camera_frame(
+            camera.name,
+            metrics,
+            image_path,
+            reported_layer=reported_layer,
+        )
+        reports.append(report)
+
+    if SAVE_COMPOSITE_FRAMES:
+        combined_dir = ensure_directory(session_root / "combined")
+        save_composite_frame(combined_dir / f"{capture_index:06d}.jpg", captured_frames)
+
+    decision = decide_failure(reports)
+    event_payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "capture_index": capture_index,
+        "reported_layer": reported_layer,
+        "triggered": decision["triggered"],
+        "reason": decision["reason"],
+        "reports": decision["reports"],
+    }
+    write_text_line(session_root / "events.log", json.dumps(event_payload))
+
+    return decision
+
+
+def connect_controller(trigger_mode: str, serial_port: str):
+    if trigger_mode not in {"layer", "hybrid"}:
+        return None
+
+    controller = MarlinPrinterController(port=serial_port)
+    try:
+        controller.connect()
+    except Exception:
+        if trigger_mode == "layer":
+            raise
+        return None
+    return controller
+
+
+def cli():
+    parser = argparse.ArgumentParser(description="Monitor a Marlin printer with two cameras.")
+    parser.add_argument("--job-name", default=timestamp_job_name())
+    parser.add_argument("--trigger-mode", choices=["layer", "timer", "hybrid"], default=TRIGGER_MODE)
+    parser.add_argument("--capture-interval", type=float, default=CAPTURE_INTERVAL_SECONDS)
+    parser.add_argument("--serial-port", default=SERIAL_PORT)
+    parser.add_argument("--background-only", action="store_true")
+    args = parser.parse_args()
+
+    session_root = ensure_directory(Path(CAPTURE_ROOT) / safe_job_name(args.job_name))
+    cameras = []
+    controller = None
+
+    try:
+        for camera_config in CAMERAS:
+            cameras.append(CameraDevice(camera_config).open())
+
+        print(f"Starting monitor session in {session_root}")
+        capture_event(session_root, cameras, capture_index=0, reported_layer="background")
+        print("Background captured for all cameras.")
+
+        if args.background_only:
+            return 0
+
+        controller = connect_controller(args.trigger_mode, args.serial_port)
+        layer_markers_seen = False
+        last_reported_layer = None
+        capture_index = 0
+        next_timer_capture = time.monotonic() + args.capture_interval
+
+        while True:
+            layer_hit = None
+
+            if controller is not None:
+                serial_line = controller.read_line()
+                if serial_line:
+                    layer_hit = parse_layer_message(serial_line)
+                    if layer_hit is not None and layer_hit == last_reported_layer:
+                        layer_hit = None
+
+            if layer_hit is not None:
+                layer_markers_seen = True
+                last_reported_layer = layer_hit
+                capture_index += 1
+                decision = capture_event(session_root, cameras, capture_index, reported_layer=layer_hit)
+                print(f"Captured layer-triggered frame set {capture_index} (layer {layer_hit})")
+                next_timer_capture = time.monotonic() + args.capture_interval
+                event_layer = layer_hit
+            elif args.trigger_mode == "timer" or (args.trigger_mode == "hybrid" and not layer_markers_seen):
+                if time.monotonic() < next_timer_capture:
+                    time.sleep(0.05)
+                    continue
+
+                capture_index += 1
+                decision = capture_event(session_root, cameras, capture_index, reported_layer=None)
+                print(f"Captured timed frame set {capture_index}")
+                next_timer_capture = time.monotonic() + args.capture_interval
+                event_layer = None
+            else:
+                time.sleep(0.05)
+                continue
+
+            if decision["triggered"]:
+                print(f"Failure detected: {decision['reason']}")
+                if controller is None:
+                    controller = MarlinPrinterController(port=args.serial_port)
+                controller.pause_print(decision["reason"], event_layer, decision["reports"])
+                print("Pause commands sent to Marlin.")
+                return 0
+
+    except KeyboardInterrupt:
+        print("Monitoring stopped by user.")
+        return 0
+    finally:
+        if controller is not None:
+            controller.close()
+        for camera in cameras:
+            camera.close()
+
+
+if __name__ == "__main__":
+    sys.exit(cli())

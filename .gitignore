@@ -1,0 +1,10 @@
+octoclient/
+test_images/
+__pycache__/
+*.pyc
+*.jpg
+*.csv
+*.log
+.vscode/*
+data/*
+captures/
