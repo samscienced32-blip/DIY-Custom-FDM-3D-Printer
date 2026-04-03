@@ -1,6 +1,6 @@
 # 3DPrintSaviour for Marlin + Dual Cameras
 
-## What changed
+## Objective
 This fork adapts the original OctoPrint/Octolapse workflow to a custom Marlin-based printer that is connected directly over USB serial and monitored with two cameras.
 
 The new workflow is:
@@ -12,8 +12,6 @@ The new workflow is:
 
 If layer messages are not available yet, `run` can also fall back to timed captures.
 
-## Files you should edit first
-Open [`api_keys.py`](/C:/Users/sagar/OneDrive/Desktop/Applications/Criss/3DPrintSaviour-marlin/api_keys.py) and set:
 
 - `SERIAL_PORT` to your printer port, for example `COM5`
 - `PAUSE_COMMANDS` to the pause/stop G-code that matches your printer workflow
